@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
 from typing import cast
 
@@ -187,6 +188,28 @@ class CustomAllreduce:
                 "warning, specify disable_custom_all_reduce=True explicitly.",
                 world_size,
                 str(CustomAllreduce._SUPPORTED_WORLD_SIZES),
+            )
+            return
+
+        # PyTorch's expandable_segments allocator uses CUDA VMM
+        # (cuMemAddressReserve/cuMemCreate/cuMemMap) rather than a single
+        # contiguous cudaMalloc allocation, and cudaIpcGetMemHandle() only
+        # understands the latter. Custom all-reduce shares CUDA-graph
+        # activation tensors (graph_unreg_buffers_) via cudaIpcGetMemHandle
+        # during graph capture, so on a fully-connected node it fails with
+        # "invalid argument" and takes EngineCore down with it. Fall back to
+        # the next all-reduce backend (NCCL symmetric memory / torch
+        # symmetric memory / plain NCCL), all of which keep their
+        # communication buffers out of the default allocator and are
+        # unaffected by this setting.
+        if "expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+            logger.warning(
+                "Custom allreduce is disabled because "
+                "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is set. "
+                "PyTorch's CUDA VMM allocator is incompatible with "
+                "cudaIpcGetMemHandle(), which custom all-reduce uses to "
+                "share CUDA-graph buffers between ranks. To silence this "
+                "warning, specify disable_custom_all_reduce=True explicitly."
             )
             return
 
