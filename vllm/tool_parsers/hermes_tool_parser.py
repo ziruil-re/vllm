@@ -25,7 +25,7 @@ from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
-from vllm.tool_parsers.utils import is_complete_json, partial_tag_overlap
+from vllm.tool_parsers.utils import partial_tag_overlap
 from vllm.utils.mistral import is_mistral_tokenizer
 
 logger = init_logger(__name__)
@@ -35,10 +35,8 @@ class Hermes2ProToolParser(ToolParser):
     structural_tag_model = "hermes"
     tool_call_start_token: str = "<tool_call>"
     tool_call_end_token: str = "</tool_call>"
-    tool_call_regex = re.compile(
-        r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)", re.DOTALL
-    )
     scratch_pad_regex = re.compile(r"<scratch_pad>(.*?)</scratch_pad>", re.DOTALL)
+    json_decoder: json.JSONDecoder = json.JSONDecoder()
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
@@ -80,18 +78,31 @@ class Hermes2ProToolParser(ToolParser):
 
         else:
             try:
-                # there are two possible captures - between tags, or between a
-                # tag and end-of-string so the result of
-                # findall is an array of tuples where one is a function call and
-                # the other is None
-                function_call_tuples = self.tool_call_regex.findall(model_output)
+                # The end of each call is read from the JSON decoder, not
+                # searched for via the closing tag: a literal closing tag
+                # occurring inside a string value (e.g. a model writing docs
+                # about tool calling) is otherwise indistinguishable from the
+                # real one.
+                raw_function_calls = []
+                pos = 0
+                while True:
+                    start = model_output.find(self.tool_call_start_token, pos)
+                    if start == -1:
+                        break
+                    json_start = start + len(self.tool_call_start_token)
+                    raw = model_output[json_start:]
+                    lstripped = raw.lstrip()
+                    skipped = len(raw) - len(lstripped)
+                    obj, end = self.json_decoder.raw_decode(lstripped)
+                    raw_function_calls.append(obj)
+                    consumed = json_start + skipped + end
+                    tag_end = model_output.find(self.tool_call_end_token, consumed)
+                    pos = (
+                        tag_end + len(self.tool_call_end_token)
+                        if tag_end != -1
+                        else consumed
+                    )
 
-                # load the JSON, and then use it to build the Function and
-                # Tool Call
-                raw_function_calls = [
-                    json.loads(match[0] if match[0] else match[1])
-                    for match in function_call_tuples
-                ]
                 tool_calls = [
                     ToolCall(
                         type="function",
@@ -139,7 +150,13 @@ class Hermes2ProToolParser(ToolParser):
         return None
 
     def _extract_tool_call_jsons(self, text: str) -> list[tuple[str, bool]]:
-        """Extract (json_text, is_complete) for each <tool_call> region."""
+        """Extract (json_text, is_complete) for each <tool_call> region.
+
+        The end of a call is read from the JSON decoder, not searched for
+        via the closing tag: a literal '</tool_call>' occurring inside a
+        string value (e.g. a model writing docs about tool calling) is
+        otherwise indistinguishable from the real closing tag.
+        """
         results: list[tuple[str, bool]] = []
         pos = 0
         while True:
@@ -147,22 +164,25 @@ class Hermes2ProToolParser(ToolParser):
             if start == -1:
                 break
             json_start = start + len(self.tool_call_start_token)
-            json_end = text.find(self.tool_call_end_token, json_start)
-            if json_end != -1:
-                results.append((text[json_start:json_end].strip(), True))
-                pos = json_end + len(self.tool_call_end_token)
-            else:
-                raw = text[json_start:]
-                # Strip partial </tool_call> suffix if present.
+            raw = text[json_start:]
+            lstripped = raw.lstrip()
+            skipped = len(raw) - len(lstripped)
+            try:
+                _, end = self.json_decoder.raw_decode(lstripped)
+            except ValueError:
+                # Not decodable yet: still streaming. Strip a partial
+                # </tool_call> suffix so it isn't mistaken for JSON content.
                 overlap = partial_tag_overlap(raw, self.tool_call_end_token)
                 if overlap:
                     raw = raw[:-overlap]
-                tc_json = raw.strip()
-                # Valid JSON without closing tag = complete body,
-                # tag tokens just haven't arrived yet.
-                is_complete = is_complete_json(tc_json) if tc_json else False
-                results.append((tc_json, is_complete))
+                results.append((raw.strip(), False))
                 break
+
+            tc_json = lstripped[:end]
+            results.append((tc_json, True))
+            consumed = json_start + skipped + end
+            tag_end = text.find(self.tool_call_end_token, consumed)
+            pos = tag_end + len(self.tool_call_end_token) if tag_end != -1 else consumed
         return results
 
     @staticmethod

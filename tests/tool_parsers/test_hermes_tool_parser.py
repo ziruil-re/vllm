@@ -412,3 +412,71 @@ def test_hermes_streaming_content_and_tool_call_in_single_chunk(
     assert tool_parts[0].function.name == "f"
     args_str = "".join(tc.function.arguments or "" for tc in tool_parts)
     assert json.loads(args_str) == {"x": 1}
+
+
+def test_hermes_parser_non_streaming_value_contains_closing_tag(
+    request: pytest.FixtureRequest,
+    hermes_parser: ToolParser,
+    any_chat_request: ChatCompletionRequest,
+) -> None:
+    """A value that legitimately contains the format's own closing tag
+    (e.g. a model writing documentation about tool calling) must not be
+    mistaken for the real closing tag. The call is well-formed; dropping
+    it entirely is a defect, not acceptable "undefined behavior"."""
+    if isinstance(hermes_parser, Granite4ToolParser):
+        # Granite4ToolParser is an independent implementation with its own
+        # <tool_call>/</tool_call> state machine; it raises an unrelated
+        # AssertionError ("Tool call end token found without corresponding
+        # start token") on this same input. That is a separate defect in a
+        # different parser and is out of scope for this hermes fix.
+        request.node.add_marker(
+            pytest.mark.xfail(
+                reason="Granite4ToolParser has its own boundary bug on this "
+                "input, unrelated to Hermes2ProToolParser's fix",
+                strict=True,
+            )
+        )
+    text = (
+        "<tool_call>\n"
+        '{"name": "write_doc", '
+        '"arguments": {"text": "the closing tag is </tool_call> ok"}}\n'
+        "</tool_call>"
+    )
+    tool_call = hermes_parser.extract_tool_calls(
+        model_output=text,
+        request=any_chat_request,
+    )
+
+    assert tool_call is not None
+    assert tool_call.tools_called
+    assert tool_call.tool_calls[0].function.name == "write_doc"
+    assert json.loads(tool_call.tool_calls[0].function.arguments) == {
+        "text": "the closing tag is </tool_call> ok"
+    }
+
+
+@pytest.mark.parametrize("stream_interval", [1, 3, 7, 9999])
+def test_hermes_streaming_value_contains_closing_tag_with_stream_interval(
+    qwen_tokenizer: TokenizerLike,
+    any_chat_request: ChatCompletionRequest,
+    stream_interval: int,
+) -> None:
+    """Streaming counterpart of the non-streaming test above: the same
+    hostile value must not truncate the streamed arguments at the first
+    literal occurrence of the closing tag inside the string."""
+    text = (
+        "<tool_call>\n"
+        '{"name": "write_doc", '
+        '"arguments": {"text": "the closing tag is </tool_call> ok"}}\n'
+        "</tool_call>"
+    )
+    parser = Hermes2ProToolParser(qwen_tokenizer)
+    deltas = _simulate_streaming(
+        qwen_tokenizer, parser, any_chat_request, text, stream_interval
+    )
+
+    tool_calls = [tc for d in deltas if d.tool_calls for tc in d.tool_calls]
+    assert tool_calls, "Expected at least one tool call delta"
+    assert tool_calls[0].function.name == "write_doc"
+    args_str = "".join(tc.function.arguments or "" for tc in tool_calls)
+    assert json.loads(args_str) == {"text": "the closing tag is </tool_call> ok"}
