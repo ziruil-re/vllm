@@ -72,44 +72,48 @@ async def test_async_llm_model_error(
     )
     async_llm = AsyncLLM.from_engine_args(engine_args)
 
-    async def generate(request_id: str):
-        generator = async_llm.generate(
-            "Hello my name is", request_id=request_id, sampling_params=SamplingParams()
+    try:
+
+        async def generate(request_id: str):
+            generator = async_llm.generate(
+                "Hello my name is",
+                request_id=request_id,
+                sampling_params=SamplingParams(),
+            )
+            try:
+                async for _ in generator:
+                    pass
+            except Exception as e:
+                return e
+
+        NUM_REQS = 3
+        tasks = [generate(f"request-{idx}") for idx in range(NUM_REQS)]
+        outputs = await asyncio.gather(*tasks)
+
+        # Every request should get an EngineDeadError.
+        for output in outputs:
+            assert isinstance(output, EngineDeadError)
+
+        # AsyncLLM should be errored.
+        assert async_llm.errored
+
+        # We should not be able to make another request.
+        with pytest.raises(EngineDeadError):
+            async for _ in async_llm.generate(
+                "Hello my name is",
+                request_id="abc",
+                sampling_params=SamplingParams(),
+            ):
+                raise Exception("We should not get here.")
+
+        # Confirm all the processes are cleaned up.
+        wait_for_gpu_memory_to_clear(
+            devices=list(range(tensor_parallel_size)),
+            threshold_bytes=2 * 2**30,
+            timeout_s=60,
         )
-        try:
-            async for _ in generator:
-                pass
-        except Exception as e:
-            return e
-
-    NUM_REQS = 3
-    tasks = [generate(f"request-{idx}") for idx in range(NUM_REQS)]
-    outputs = await asyncio.gather(*tasks)
-
-    # Every request should get an EngineDeadError.
-    for output in outputs:
-        assert isinstance(output, EngineDeadError)
-
-    # AsyncLLM should be errored.
-    assert async_llm.errored
-
-    # We should not be able to make another request.
-    with pytest.raises(EngineDeadError):
-        async for _ in async_llm.generate(
-            "Hello my name is", request_id="abc", sampling_params=SamplingParams()
-        ):
-            raise Exception("We should not get here.")
-
-    # Confirm all the processes are cleaned up.
-    wait_for_gpu_memory_to_clear(
-        devices=list(range(tensor_parallel_size)),
-        threshold_bytes=2 * 2**30,
-        timeout_s=60,
-    )
-
-    # NOTE: shutdown is handled by the API Server if an exception
-    # occurs, so it is expected that we would need to call this.
-    async_llm.shutdown()
+    finally:
+        async_llm.shutdown()
 
 
 @pytest.mark.timeout(SHUTDOWN_TEST_TIMEOUT_SEC)
@@ -141,11 +145,16 @@ def test_llm_model_error(
             model=model, enforce_eager=True, tensor_parallel_size=tensor_parallel_size
         )
 
-        with pytest.raises(EngineDeadError if enable_multiprocessing else Exception):
-            llm.generate("Hello my name is Robert and I")
+        try:
+            with pytest.raises(
+                EngineDeadError if enable_multiprocessing else Exception
+            ):
+                llm.generate("Hello my name is Robert and I")
 
-        # Confirm all the processes are cleaned up.
-        wait_for_gpu_memory_to_clear(
-            devices=list(range(tensor_parallel_size)),
-            threshold_bytes=SHUTDOWN_TEST_THRESHOLD_BYTES,
-        )
+            # Confirm all the processes are cleaned up.
+            wait_for_gpu_memory_to_clear(
+                devices=list(range(tensor_parallel_size)),
+                threshold_bytes=SHUTDOWN_TEST_THRESHOLD_BYTES,
+            )
+        finally:
+            del llm

@@ -28,49 +28,51 @@ async def test_async_llm_processor_error(model: str) -> None:
     engine_args = AsyncEngineArgs(model=model, enforce_eager=True)
     async_llm = AsyncLLM.from_engine_args(engine_args)
 
-    async def generate(request_id: str):
-        # An encoder/decoder prompt is rejected by the Processor for a
-        # decoder only model.
-        generator = async_llm.generate(
-            ExplicitEncoderDecoderPrompt(
-                encoder_prompt="Hello my name is", decoder_prompt=None
+    try:
+
+        async def generate(request_id: str):
+            # An encoder/decoder prompt is rejected by the Processor for a
+            # decoder only model.
+            generator = async_llm.generate(
+                ExplicitEncoderDecoderPrompt(
+                    encoder_prompt="Hello my name is", decoder_prompt=None
+                ),
+                request_id=request_id,
+                sampling_params=SamplingParams(),
+            )
+            try:
+                async for _ in generator:
+                    pass
+            except Exception as e:
+                return e
+
+        NUM_REQS = 3
+        tasks = [generate(f"request-{idx}") for idx in range(NUM_REQS)]
+        outputs = await asyncio.gather(*tasks)
+
+        # Every request should have get an EngineGenerateError.
+        for output in outputs:
+            with pytest.raises(EngineGenerateError):
+                raise output
+
+        # AsyncLLM should be errored.
+        assert not async_llm.errored
+
+        # This should be no problem.
+        EXPECTED_TOKENS = 5
+        outputs = []
+        async for out in async_llm.generate(
+            "Hello my name is",
+            request_id="abc",
+            sampling_params=SamplingParams(
+                max_tokens=EXPECTED_TOKENS, output_kind=RequestOutputKind.DELTA
             ),
-            request_id=request_id,
-            sampling_params=SamplingParams(),
-        )
-        try:
-            async for _ in generator:
-                pass
-        except Exception as e:
-            return e
+        ):
+            outputs.append(out)
 
-    NUM_REQS = 3
-    tasks = [generate(f"request-{idx}") for idx in range(NUM_REQS)]
-    outputs = await asyncio.gather(*tasks)
-
-    # Every request should have get an EngineGenerateError.
-    for output in outputs:
-        with pytest.raises(EngineGenerateError):
-            raise output
-
-    # AsyncLLM should be errored.
-    assert not async_llm.errored
-
-    # This should be no problem.
-    EXPECTED_TOKENS = 5
-    outputs = []
-    async for out in async_llm.generate(
-        "Hello my name is",
-        request_id="abc",
-        sampling_params=SamplingParams(
-            max_tokens=EXPECTED_TOKENS, output_kind=RequestOutputKind.DELTA
-        ),
-    ):
-        outputs.append(out)
-
-    generated_tokens = []
-    for out in outputs:
-        generated_tokens.extend(out.outputs[0].token_ids)
-    assert len(generated_tokens) == EXPECTED_TOKENS
-
-    async_llm.shutdown()
+        generated_tokens = []
+        for out in outputs:
+            generated_tokens.extend(out.outputs[0].token_ids)
+        assert len(generated_tokens) == EXPECTED_TOKENS
+    finally:
+        async_llm.shutdown()
